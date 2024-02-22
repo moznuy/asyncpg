@@ -24,8 +24,6 @@ cdef class SCRAMAuthentication:
     cdef create_client_final_message(self, str password)
     cdef parse_server_first_message(self, bytes server_response)
     cdef verify_server_final_message(self, bytes server_final_message)
-    cdef _bytes_xor(self, bytes a, bytes b)
     cdef _generate_client_nonce(self, int num_bytes)
     cdef _generate_client_proof(self, str password)
-    cdef _generate_salted_password(self, str password, bytes salt, int iterations)
     cdef _normalize_password(self, str original_password)

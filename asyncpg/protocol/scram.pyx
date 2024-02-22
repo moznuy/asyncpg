@@ -6,6 +6,7 @@
 
 
 import base64
+import functools
 import hashlib
 import hmac
 import re
@@ -13,6 +14,46 @@ import secrets
 import stringprep
 import unicodedata
 
+
+HMAC_CYCLES = 0
+
+
+cdef _bytes_xor(bytes a, bytes b):
+    """XOR two bytestrings together"""
+    return bytes(a_i ^ b_i for a_i, b_i in zip(a, b))
+
+
+@functools.lru_cache
+# TODO: cdef can not be done with "general" decorators
+def _generate_salted_password(str password, bytes salt, int iterations):
+    """This follows the "Hi" algorithm specified in RFC5802"""
+    global HMAC_CYCLES
+    cdef:
+        bytes p
+        bytes s
+        bytes u
+        int x
+
+    # convert the password to a binary string - UTF8 is safe for SASL
+    # (though there are SASLPrep rules)
+    p = password.encode("utf8")
+    # the salt needs to be base64 decoded -- full binary must be used
+    s = base64.b64decode(salt)
+    # the initial signature is the salt with a terminator of a 32-bit string
+    # ending in 1
+    ui = hmac.new(p, s + b'\x00\x00\x00\x01', SCRAMAuthentication.DIGEST)
+    HMAC_CYCLES += 1
+    # grab the initial digest
+    u = ui.digest()
+    # for X number of iterations, recompute the HMAC signature against the
+    # password and the latest iteration of the hash, and XOR it with the
+    # previous version
+    for x in range(iterations - 1):
+        ui = hmac.new(p, ui.digest(), hashlib.sha256)
+        HMAC_CYCLES += 1
+        # this is a fancy way of XORing two byte strings together
+        u = _bytes_xor(u, ui.digest())
+    return u
 
 @cython.final
 cdef class SCRAMAuthentication:
@@ -168,6 +209,7 @@ cdef class SCRAMAuthentication:
 
     cdef verify_server_final_message(self, bytes server_final_message):
         """Verify the final message from the server"""
+        global HMAC_CYCLES
         cdef:
             bytes server_signature
 
@@ -179,13 +221,10 @@ cdef class SCRAMAuthentication:
 
         verify_server_signature = hmac.new(self.server_key.digest(),
             self.authorization_message, self.DIGEST)
+        HMAC_CYCLES += 1
         # validate the server signature against the verifier
         return server_signature == base64.b64encode(
             verify_server_signature.digest())
-
-    cdef _bytes_xor(self, bytes a, bytes b):
-        """XOR two bytestrings together"""
-        return bytes(a_i ^ b_i for a_i, b_i in zip(a, b))
 
     cdef _generate_client_nonce(self, int num_bytes):
         cdef:
@@ -196,23 +235,29 @@ cdef class SCRAMAuthentication:
         return base64.b64encode(token)
 
     cdef _generate_client_proof(self, str password):
+        global HMAC_CYCLES
         """need to ensure a server response exists, i.e. """
         cdef:
             bytes salted_password
+            bytes tmp
+            str key
 
         if any([getattr(self, val) is None for val in
                 self.REQUIREMENTS_CLIENT_PROOF]):
             raise Exception(
                 "you need values from server to generate a client proof")
         # generate a salt password
-        salted_password = self._generate_salted_password(password,
-            self.password_salt, self.password_iterations)
+        salted_password = _generate_salted_password(password,self.password_salt, self.password_iterations)
+
         # client key is derived from the salted password
         client_key = hmac.new(salted_password, b"Client Key", self.DIGEST)
+
+        HMAC_CYCLES += 1
         # this allows us to compute the stored key that is residing on the server
         stored_key = self.DIGEST(client_key.digest())
         # as well as compute the server key
         self.server_key = hmac.new(salted_password, b"Server Key", self.DIGEST)
+        HMAC_CYCLES += 1
         # build the authorization message that will be used in the
         # client signature
         # the "c=" portion is for the channel binding, but this is not
@@ -224,34 +269,9 @@ cdef class SCRAMAuthentication:
         # sign!
         client_signature = hmac.new(stored_key.digest(),
             self.authorization_message, self.DIGEST)
+        HMAC_CYCLES += 1
         # and the proof
-        return self._bytes_xor(client_key.digest(), client_signature.digest())
-
-    cdef _generate_salted_password(self, str password, bytes salt, int iterations):
-        """This follows the "Hi" algorithm specified in RFC5802"""
-        cdef:
-            bytes p
-            bytes s
-            bytes u
-
-        # convert the password to a binary string - UTF8 is safe for SASL
-        # (though there are SASLPrep rules)
-        p = password.encode("utf8")
-        # the salt needs to be base64 decoded -- full binary must be used
-        s = base64.b64decode(salt)
-        # the initial signature is the salt with a terminator of a 32-bit string
-        # ending in 1
-        ui = hmac.new(p, s + b'\x00\x00\x00\x01', self.DIGEST)
-        # grab the initial digest
-        u = ui.digest()
-        # for X number of iterations, recompute the HMAC signature against the
-        # password and the latest iteration of the hash, and XOR it with the
-        # previous version
-        for x in range(iterations - 1):
-            ui = hmac.new(p, ui.digest(), hashlib.sha256)
-            # this is a fancy way of XORing two byte strings together
-            u = self._bytes_xor(u, ui.digest())
-        return u
+        return _bytes_xor(client_key.digest(), client_signature.digest())
 
     cdef _normalize_password(self, str original_password):
         """Normalize the password using the SASLprep from RFC4013"""

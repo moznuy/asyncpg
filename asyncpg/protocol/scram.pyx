@@ -6,6 +6,7 @@
 
 
 import base64
+import functools
 import hashlib
 import hmac
 import re
@@ -14,9 +15,7 @@ import stringprep
 import unicodedata
 
 
-USE_CACHE = False
 HMAC_CYCLES = 0
-CACHE = {}
 
 @cython.final
 cdef class SCRAMAuthentication:
@@ -189,7 +188,8 @@ cdef class SCRAMAuthentication:
         return server_signature == base64.b64encode(
             verify_server_signature.digest())
 
-    cdef _bytes_xor(self, bytes a, bytes b):
+    @staticmethod
+    cdef _bytes_xor(bytes a, bytes b):
         """XOR two bytestrings together"""
         return bytes(a_i ^ b_i for a_i, b_i in zip(a, b))
 
@@ -202,9 +202,7 @@ cdef class SCRAMAuthentication:
         return base64.b64encode(token)
 
     cdef _generate_client_proof(self, str password):
-        global USE_CACHE
         global HMAC_CYCLES
-        global CACHE
         """need to ensure a server response exists, i.e. """
         cdef:
             bytes salted_password
@@ -216,19 +214,8 @@ cdef class SCRAMAuthentication:
             raise Exception(
                 "you need values from server to generate a client proof")
         # generate a salt password
-        if USE_CACHE:
-            key = f"{password}:{self.password_salt}:{self.password_iterations}"
-            if key not in CACHE:
-                tmp = self._generate_salted_password(password,
-                    self.password_salt, self.password_iterations)
-                CACHE[key] = tmp
-            salted_password = CACHE[key]
-        else:
-            salted_password = self._generate_salted_password(
-                password,
-                self.password_salt,
-                self.password_iterations
-            )
+        salted_password = SCRAMAuthentication._generate_salted_password(password,
+            self.password_salt, self.password_iterations)
 
         # client key is derived from the salted password
         client_key = hmac.new(salted_password, b"Client Key", self.DIGEST)
@@ -252,9 +239,11 @@ cdef class SCRAMAuthentication:
             self.authorization_message, self.DIGEST)
         HMAC_CYCLES += 1
         # and the proof
-        return self._bytes_xor(client_key.digest(), client_signature.digest())
+        return SCRAMAuthentication._bytes_xor(client_key.digest(), client_signature.digest())
 
-    cdef _generate_salted_password(self, str password, bytes salt, int iterations):
+    @functools.lru_cache
+    @staticmethod
+    def _generate_salted_password(str password, bytes salt, int iterations):
         """This follows the "Hi" algorithm specified in RFC5802"""
         global HMAC_CYCLES
         cdef:
@@ -269,7 +258,7 @@ cdef class SCRAMAuthentication:
         s = base64.b64decode(salt)
         # the initial signature is the salt with a terminator of a 32-bit string
         # ending in 1
-        ui = hmac.new(p, s + b'\x00\x00\x00\x01', self.DIGEST)
+        ui = hmac.new(p, s + b'\x00\x00\x00\x01', SCRAMAuthentication.DIGEST)
         HMAC_CYCLES += 1
         # grab the initial digest
         u = ui.digest()
@@ -280,7 +269,7 @@ cdef class SCRAMAuthentication:
             ui = hmac.new(p, ui.digest(), hashlib.sha256)
             HMAC_CYCLES += 1
             # this is a fancy way of XORing two byte strings together
-            u = self._bytes_xor(u, ui.digest())
+            u = SCRAMAuthentication._bytes_xor(u, ui.digest())
         return u
 
     cdef _normalize_password(self, str original_password):
